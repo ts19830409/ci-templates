@@ -77,13 +77,13 @@ on:
         required: false
       EMAIL_HOST_PASSWORD:
         required: false
-      GITHUB_TOKEN:
-        required: false
 
 jobs:
   deploy:
     runs-on: [self-hosted, linux, x64]
     environment: prod
+    permissions:
+      contents: read
     env:
       COMPOSE_FILE: ${{ inputs.compose_file }}
     defaults:
@@ -104,13 +104,12 @@ jobs:
         run: |
           set -e
           cd "${{ inputs.project_dir }}"
-          REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          REPO="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           if [ ! -d .git ]; then
             git clone "$REPO" .
           else
-            git remote set-url origin "$REPO"
-            git fetch origin main
-            git reset --hard origin/main
+            git fetch "$REPO" main
+            git reset --hard FETCH_HEAD
           fi
           git log --oneline -1
 
