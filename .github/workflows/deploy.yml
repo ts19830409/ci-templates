@@ -1,0 +1,176 @@
+name: Reusable Deploy (Django + Docker Compose, self-hosted)
+
+# Общий деплой для production-проектов. Вызывается из workflow проекта:
+#   jobs:
+#     deploy:
+#       uses: ts19830409/ci-templates/.github/workflows/deploy.yml@main
+#       secrets: inherit
+#       with:
+#         project_dir: /srv/my_site
+#         project_name: my_site
+#         site_domain: ts-dev27.ru
+#         db_name: my_site_db
+#
+# Требования к раннеру: self-hosted + linux + x64, Docker, домен проекта уже в репозитории.
+# Секреты берутся из окружения "prod" вызывающего репозитория (не хранятся в этом шаблоне).
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: Путь к проекту на сервере
+        type: string
+        required: true
+      project_name:
+        description: Имя compose-проекта (префикс контейнеров, напр. my_site)
+        type: string
+        required: true
+      site_domain:
+        description: Домен сайта (через запятую можно несколько, напр. example.ru,www.example.ru)
+        type: string
+        required: true
+      db_name:
+        description: Имя базы данных
+        type: string
+        required: true
+      db_user:
+        description: Пользователь БД
+        type: string
+        required: false
+        default: postgres
+      smtp_host:
+        description: SMTP-сервер
+        type: string
+        required: false
+        default: smtp.yandex.ru
+      smtp_port:
+        description: Порт SMTP
+        type: string
+        required: false
+        default: '465'
+      compose_file:
+        description: Файлы compose через двоеточие
+        type: string
+        required: false
+        default: docker-compose.yml:docker-compose.prod.yml
+      run_tests:
+        description: 'Гонять manage.py test перед миграциями: true/false'
+        type: string
+        required: false
+        default: 'true'
+      media_bundle_url:
+        description: Ссылка на архив медиа; если пусто — медиа не трогаем
+        type: string
+        required: false
+        default: ''
+      smoke_url:
+        description: URL для проверки ответа сайта
+        type: string
+        required: false
+        default: http://127.0.0.1/
+    secrets:
+      SECRET_KEY:
+        required: false
+      DB_PASSWORD:
+        required: false
+      EMAIL_HOST_USER:
+        required: false
+      EMAIL_HOST_PASSWORD:
+        required: false
+      GITHUB_TOKEN:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64]
+    environment: prod
+    env:
+      COMPOSE_FILE: ${{ inputs.compose_file }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Предварительные проверки
+        run: |
+          set -e
+          docker version >/dev/null
+          test -d "${{ inputs.project_dir }}" || {
+            echo "каталога ${{ inputs.project_dir }} нет — нужен первичный клон вручную"
+            exit 1
+          }
+          df -h "${{ inputs.project_dir }}" | tail -1
+
+      - name: Обновляем код
+        run: |
+          set -e
+          cd "${{ inputs.project_dir }}"
+          REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if [ ! -d .git ]; then
+            git clone "$REPO" .
+          else
+            git remote set-url origin "$REPO"
+            git fetch origin main
+            git reset --hard origin/main
+          fi
+          git log --oneline -1
+
+      - name: Пишем .env
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -e
+          cat > .env << 'ENVEOF'
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          DEBUG=False
+          ALLOWED_HOSTS=${{ inputs.site_domain }},localhost,127.0.0.1
+          NAME=${{ inputs.db_name }}
+          DB_USER=${{ inputs.db_user }}
+          PASSWORD=${{ secrets.DB_PASSWORD }}
+          HOST=db
+          PORT=5432
+          EMAIL_HOST=${{ inputs.smtp_host }}
+          EMAIL_PORT=${{ inputs.smtp_port }}
+          EMAIL_HOST_USER=${{ secrets.EMAIL_HOST_USER }}
+          EMAIL_HOST_PASSWORD=${{ secrets.EMAIL_HOST_PASSWORD }}
+          ENVEOF
+          chmod 600 .env
+
+      - name: Поднимаем стек
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -e
+          docker compose up --build -d --force-recreate
+          timeout 180 sh -c "until [ \"\$(docker inspect -f '{{.State.Running}}' ${{ inputs.project_name }}-web-1 2>/dev/null)\" = true ]; do sleep 3; done"
+
+      - name: Тесты, миграции, статика
+        if: ${{ inputs.run_tests == 'true' }}
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          for i in 1 2 3; do
+            if docker compose exec -T web sh -c 'python manage.py test --noinput && \
+              python manage.py migrate --noinput && \
+              python manage.py collectstatic --noinput'; then
+              break
+            fi
+            echo "попытка $i не удалась, ещё раз через 10 с"
+            sleep 10
+            test "$i" = 3 && exit 1
+          done
+
+      - name: Медиа из архива
+        if: ${{ inputs.media_bundle_url != '' }}
+        working-directory: ${{ inputs.project_dir }}
+        run: |
+          if curl -fsSL -o /tmp/media-bundle.tar.gz "${{ inputs.media_bundle_url }}"; then
+            docker compose exec -T web sh -c 'find /app/media -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -xzf - --strip-components=1 -C /app/media' < /tmp/media-bundle.tar.gz
+          else
+            echo "архив медиа недоступен — пропускаю"
+          fi
+
+      - name: Ждём ответа сайта
+        run: |
+          timeout 300 sh -c "until curl -fsS -o /dev/null '${{ inputs.smoke_url }}'; do sleep 5; done"
+          curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' '${{ inputs.smoke_url }}'
+
+      - name: Гарантируем запущенное состояние
+        working-directory: ${{ inputs.project_dir }}
+        run: docker compose up -d
